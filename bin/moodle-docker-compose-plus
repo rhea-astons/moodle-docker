@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Get the directory of this script (even if the script is called through a symlink)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ] ; do SOURCE="$(readlink "$SOURCE")"; done
+MOODLE_DOCKER_BINDIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+
+MOODLE_DOCKER_DIR=$(realpath $(dirname $MOODLE_DOCKER_BINDIR))
+
+# Check that the config.docker-template.php exists in the directory
+if [ ! -r "$MOODLE_DOCKER_DIR/config.docker-template.php" ]; then
+    >&2 echo 'Error: $MOODLE_DOCKER_DIR could not be determined to be an existing directory'
+    exit 1
+fi
+
+export MOODLE_DOCKER_WWWROOT=`pwd`
+
+if [ ! -r "$MOODLE_DOCKER_WWWROOT/config-dist.php" ]; then
+    >&2 echo 'Error: ./config-dist.php is not present; are you running this from a Moodle directory?'
+    exit 1
+fi
+
+# Personal settings.
+if [ -r "$HOME/.moodle-compose.env" ]; then
+    . $HOME/.moodle-compose.env
+fi
+
+# Moodle instance settings
+if [ -r "$MOODLE_DOCKER_WWWROOT/projectinfo.yml" ]; then
+    MOODLE_CODENAME=$(grep -e  '^codename' "$MOODLE_DOCKER_WWWROOT/projectinfo.yml" | awk -F ': ' '{print $2}')
+    MOODLE_DB_TYPE=$(grep -e  '^sqltype' "$MOODLE_DOCKER_WWWROOT/projectinfo.yml" | awk -F ': ' '{print $2}')
+fi
+
+if [ -z "${MOODLE_CODENAME}" ]; then
+    >&2 echo 'Error: $MOODLE_CODENAME not set'
+    >&2 echo '       It should be set either in:'
+    >&2 echo '        - the environment (export MOODLE_CODENAME=)'
+    >&2 echo '        - projectinfo.yml (codename:)'
+    exit 1
+fi
+
+export MOODLE_CODENAME=${MOODLE_CODENAME}
+
+# Related to Moodle
+if [ -z "${MOODLE_DB_TYPE}" ]; then
+    export MOODLE_DOCKER_DB=${MOODLE_DOCKER_DB:-pgsql}
+else
+    export MOODLE_DOCKER_DB=${MOODLE_DOCKER_DB:-${MOODLE_DB_TYPE}}
+fi
+
+export MOODLE_DOCKER_PHP_VERSION=${MOODLE_DOCKER_PHP_VERSION:-7.3}
+
+# Related to one's local setup
+export MOODLE_DOCKER_NETWORK=${MOODLE_DOCKER_NETWORK:-astons.dev}
+export MOODLE_DOCKER_WEB_HOST=${MOODLE_DOCKER_WEB_HOST:-${MOODLE_CODENAME}.${MOODLE_DOCKER_NETWORK}}
+export MOODLE_DOCKER_TRAEFIK=${MOODLE_DOCKER_NO_TRAEFIK:-enabled}
+export MOODLE_DOCKER_TRAEFIK_HTTPS=${MOODLE_DOCKER_TRAEFIK_HTTP_ONLY:-true}
+
+export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-${MOODLE_CODENAME}}
+
+# Force-copy the most recent config.php
+if ! [ -r ./config.php ] || ! diff -q $MOODLE_DOCKER_DIR/config.docker-template.php ./config.php; then
+    rm -f ./config.php
+    cp $MOODLE_DOCKER_DIR/config.docker-template.php ./config.php
+fi
+
+ARGS=
+dump=
+
+if [ -n "$1" ]; then
+    case $1 in
+    install|i)
+        # Standard local installation
+        ARGS="exec webserver php admin/cli/install_database.php"
+        ARGS="$ARGS --agree-license"
+        ARGS="$ARGS --fullname=${MOODLE_CODENAME}"
+        ARGS="$ARGS --shortname=${MOODLE_CODENAME}"
+        ARGS="$ARGS --adminemail=admin@${MOODLE_DOCKER_WEB_HOST}"
+        ARGS="$ARGS --adminuser=admin"
+        ARGS="$ARGS --adminpass=adminadmin"
+        shift 1
+        ;;
+    upgrade|u)
+        ARGS="exec webserver php admin/cli/upgrade.php"
+        ARGS="$ARGS --non-interactive"
+        ARGS="$ARGS --allow-unstable"
+        shift 1
+        ;;
+    purge_caches|pc)
+        ARGS="exec webserver php admin/cli/purge_caches.php"
+        shift 1
+        ;;
+    adhoc_tasks|at)
+        ARGS="exec webserver php admin/tool/task/cli/adhoc_task.php --execute"
+        shift 1
+        ;;
+    cron|c)
+        ARGS="exec webserver php admin/cli/cron.php"
+        shift 1
+        ;;
+    pgrestore|pgr)
+        if [ -z $2  ]; then
+	        echo "Insert the name of the pgdump file: "
+	        read dump
+        else
+	        dump=$2
+        fi
+        if [ ! -f $dump ]; then
+          >&2  printf "\n>> File $dump not found\n\n"
+          exit 1
+        fi
+        clear
+        printf "\n>>> Removing the Moodle DB\n\n"
+        moodle-compose exec -T db /usr/bin/dropdb -e -U moodle moodle
+        printf "\n>>> Recreating the Moodle DB from template0\n\n"
+        moodle-compose exec -T db /usr/bin/createdb -e -U moodle -T template0 -O moodle moodle
+        printf "\n>>> Restoring the Moodle DB with the pgdump file (Chill for a while)\n\n"
+        cat $dump | moodle-compose exec -T db /usr/bin/pg_restore -U moodle -d moodle --no-owner && echo ""
+        printf "\n>>> Moodle DB restored!\n\n>>> Updating Moodle DB\n\n"
+        moodle-compose u
+        printf "\n>>> Purging the Moodle cache\n\n"
+        moodle-compose pc
+        printf "\nMoodle is ready => http://${MOODLE_CODENAME}.docker.test\n"
+        exit 1
+        ;;
+
+    pglocaldump|pgld)
+        # Useful to have a local snapshot of DB after some work (specially upgrading the db, which could be time burner)
+        filename="${MOODLE_CODENAME}_local_dbdump.pgdump"
+        moodle-compose exec -T db /usr/bin/pg_dump -U moodle --format=custom moodle > ${filename}
+        printf "\nMoodle local DB has been dumped => ${filename}"
+        exit 1
+        ;;
+
+    mysqlrestore|mysqlr)
+        #  Note: Restoring large mysql dumps might crash at some point (e.g ~4Gb)
+        #  If it is the case this is the proven manual procedure:
+        #   gunzip < [dump.sql.gz] | moodle-compose exec -T db tee /var/tmp/dump.sql > /dev/null
+        #   moodle-compose exec db bash
+        #    mysql -pm@0dl3ing
+        #     SET GLOBAL max_allowed_packet=16*1024*1024;
+        #     quit;
+        #    grep -Ev "INSERT INTO \`.*_logstore_standard" /var/tmp/dump.sql | grep -v 'CHANGE MASTER' | mysql -p$MYSQL_PASSWORD moodle -v
+        #    exit
+        #   moodle-compose u
+        #   moodle-compose pc
+        #
+        #                            Try at your own risk! Feel free to improve it!
+
+        if [ -z $2  ]; then
+            echo "Insert the name of the mysql dump file (.sql.gz) "
+            read dump
+            else
+            dump=$2
+        fi
+        if [ ! -f $dump ]; then
+            >&2  printf "\n>> File $dump not found\n\n"
+            exit 1
+        fi
+        clear
+        printf "\n>>> Restoring the Moodle DB with the dbdump file (Chill for a while)\n\n"
+        gunzip < $dump | moodle-compose exec -T db /usr/bin/mysql -u root --show-warnings --password=m@0dl3ing moodle
+        printf "\n>>> Moodle DB restored!\n\n>>> Updating Moodle DB\n\n"
+        moodle-compose u
+        printf "\n>>> Purging the Moodle cache\n\n"
+        moodle-compose pc
+        printf "\nMoodle is ready => http://${MOODLE_CODENAME}.docker.test\n"
+        exit 1
+        ;;
+
+    mysqllocaldump|mysqlld)
+        # Useful to have a local snapshot of DB after some work (specially upgrading the db, which could be time burner)
+        clear
+        printf "\n>>> Dumping the local Moodle mysql DB (Chill for a while)\n\n"
+        moodle-compose exec -T db /usr/bin/mysqldump -u root --password=m@0dl3ing moodle | gzip > ${MOODLE_CODENAME}_local_dbdump.sql.gz
+        printf "\nThe local Moodle DB has been dumped to the file => ${MOODLE_CODENAME}_local_dbdump.sql.gz\n"
+        exit 1
+        ;;
+
+    esac
+else
+    echo "
+    moodle-compose is a Liip implementation based on moodle-docker-compose
+
+    Usage (at least one option should be provided)
+
+    install|i               Moodle installation
+    upgrade|u               Moodle DB uprade
+    purge_caches|pc         Moddle cache purge
+    adhoc_tasks|at          Process Moodle adhoc_tasks
+    cron|c                  Process all pending Moodle Cron Jobs
+    pgrestore|pgr           Restore POSTGRES Moodle DB from .pgdump file
+    pglocaldump|pgld        Dump the local Postgres Moodle DB to [MOODLE_CODENAME]_local_dbdump.pgdump
+    mysqlrestore|mysqlr     Restore MYSQL Moodle DB from .sql.gz file
+    mysqllocaldump|mysqlld  Dump the local MYSQL Moodle DB to [MOODLE_CODENAME]_local_dbdump.sql.gz
+
+    Also, all docker-compose commands will work as well, for instance:
+        moodle-compose exec webserver bash
+    "
+  exit 1
+fi
+
+$MOODLE_DOCKER_DIR/bin/moodle-docker-compose $ARGS "$@"
