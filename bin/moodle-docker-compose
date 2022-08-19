@@ -38,6 +38,12 @@ dockercompose="${dockercompose} -f ${basedir}/service.mail.yml"
 # PHP Version.
 export MOODLE_DOCKER_PHP_VERSION=${MOODLE_DOCKER_PHP_VERSION:-7.4}
 
+# Enable Traefik
+if [ "$MOODLE_DOCKER_TRAEFIK" == "enabled" ];
+then
+    dockercompose="${dockercompose} -f ${basedir}/traefik.yml"
+fi
+
 # Database flavour
 if [ "$MOODLE_DOCKER_DB" != 'pgsql' ];
 then

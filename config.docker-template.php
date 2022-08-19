@@ -19,7 +19,11 @@ if (!empty(getenv('MOODLE_DOCKER_WEB_HOST'))) {
 }
 $CFG->wwwroot   = "http://{$host}";
 $port = getenv('MOODLE_DOCKER_WEB_PORT');
-if (!empty($port)) {
+$traefik = getenv('MOODLE_DOCKER_TRAEFIK');
+if ($traefik == "enabled") {
+    $CFG->sslproxy = true;
+    $CFG->wwwroot = "https://{$host}";
+} else if (!empty($port)) {
     // Extract port in case the format is bind_ip:port.
     $parts = explode(':', $port);
     $port = end($parts);
